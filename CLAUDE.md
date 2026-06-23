@@ -73,8 +73,8 @@ that way when possible — zero code diff = trivial upstream merges. If you must
 code, record it here so future merges are conflict-aware, and prefer upstreaming the
 fix as a PR over carrying a private diff.
 
-### Candidate upstream PR (not yet done)
-- Question-form NL queries (e.g. `"what is a sparse autoencoder"`) still return junk
-  because `search_arxiv` sends `all:<full query>` without dropping stopwords. Keyword
-  queries work fine. A small stopword-stripping / per-term `all:x AND all:y` reformat
-  would fix it — better contributed upstream than carried locally.
+### Known quirk (no action planned)
+- arXiv relevance search is stopword-sensitive: a question-form query like
+  `"what is a sparse autoencoder"` returns junk, while the keyword form
+  `"sparse autoencoder"` works. Not worth fixing — the caller is an LLM, which
+  passes keywords, not natural-language questions.
