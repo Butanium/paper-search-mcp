@@ -1,13 +1,15 @@
 # paper-search-mcp — Butanium audited fork
 
 This is **our fork** of [`openags/paper-search-mcp`](https://github.com/openags/paper-search-mcp)
-(an MCP server for searching/downloading academic papers). It is consumed as a
-**git submodule** inside `~/.claude` at `mcp/paper-search-mcp`, and the Claude Code
-MCP config runs it directly from this source tree:
+(an MCP server for searching/downloading academic papers). It is a **nested git
+submodule**: it lives inside the `custom-claude-mcps` repo (`~/.claude/mcp`), which is
+itself a submodule of `~/.claude`. It runs from this source tree as a shared
+streamable-HTTP server, not per-session stdio: `~/.claude/mcp/serve_http.py paper-search`
+(`uv run --project` into this venv, then serves `paper_search_mcp.server` on
+`127.0.0.1:8874/mcp`) under the systemd user unit `claude-mcp@paper-search`.
 
-```
-uv run --project ~/.claude/mcp/paper-search-mcp python -m paper_search_mcp.server
-```
+**Code changes take effect only after `systemctl --user restart claude-mcp@paper-search`.**
+Logs (e.g. the arXiv non-200 warnings): `journalctl --user -u claude-mcp@paper-search`.
 
 ## Why we forked (not just `uv --with paper-search-mcp`)
 
@@ -53,6 +55,7 @@ Upstream is active (1900+★). To pull improvements:
 
 ```bash
 cd ~/.claude/mcp/paper-search-mcp
+git remote get-url upstream || git remote add upstream https://github.com/openags/paper-search-mcp
 git fetch upstream
 git log --oneline HEAD..upstream/main      # what's new since our pin
 # review the diff of the new commits (security re-audit of NEW code only):
@@ -60,7 +63,10 @@ git diff HEAD..upstream/main
 git merge upstream/main                     # or cherry-pick
 git push origin main                        # update our fork
 uv sync                                      # refresh deps
-# then in ~/.claude: git add mcp/paper-search-mcp && commit (bump submodule pointer)
+systemctl --user restart claude-mcp@paper-search
+# bump the pointer one level up, in custom-claude-mcps:
+cd ~/.claude/mcp && git add paper-search-mcp && git commit && git push
+# then in ~/.claude: git add mcp && commit (bump the custom-claude-mcps pointer)
 ```
 
 When a proper PyPI release > 0.1.3 lands, we *could* drop this fork and go back to a
@@ -68,10 +74,33 @@ versioned pin — but only if we're happy giving up the read-before-run guarante
 
 ## Local changes vs upstream
 
-**None.** This fork is a pure audited mirror of upstream + this `CLAUDE.md`. Keep it
-that way when possible — zero code diff = trivial upstream merges. If you must change
-code, record it here so future merges are conflict-aware, and prefer upstreaming the
-fix as a PR over carrying a private diff.
+Keep the code diff minimal: zero diff = trivial upstream merges. Record every local
+change here so merges are conflict-aware, and prefer upstreaming a fix as a PR over
+carrying a private diff.
+
+- **`academic_platforms/arxiv.py` (2026-09-25): no-ALPN handshake + loud failures.**
+  From 2026-09-25 (worked 2026-09-16) arXiv's export API edge answered **HTTP 406, empty
+  body**, to every cache-missing request from this venv's Python (uv CPython 3.13 /
+  OpenSSL 3.5.6), via requests, httpx and urllib alike, so `search_arxiv` returned `[]`
+  for every query. Verified cause: the TLS ClientHello, not HTTP. The same raw HTTP
+  bytes sent over Python `ssl` get 406 when the handshake offers ALPN `http/1.1` and
+  200 without ALPN; request headers (UA, Accept, Accept-Encoding, Connection) make no
+  difference; curl (any HTTP version) and the system Python 3.14 (OpenSSL's default
+  30-suite cipher list + `compress_certificate`, vs 3.13's own 17-suite list) get 200
+  even with ALPN. Gotcha when re-testing: a CDN cache HIT (`X-Cache: ..., HIT`) returns
+  200 to any client, so vary the URL (e.g. `start=`) per probe. Changes:
+  1. `BASE_URL` is https (http only 301s to https; upstream made the same change).
+  2. The session mounts `_NoALPNAdapter` for `https://export.arxiv.org/`. It is an
+     `SSLContext` subclass whose `set_alpn_protocols` is a no-op, because urllib3 sets
+     ALPN on every context it wraps. Certificate and hostname verification are
+     unchanged (checked against badssl.com).
+  3. A non-200 response or an exhausted network retry now logs a warning (status, URL,
+     body) and **raises** instead of returning `[]`, so the tool call errors visibly and
+     `search_papers` records it in `errors`. Upstream issue openags#121 reports the same
+     406 as intermittent, and upstream `main` (checked at `808e462`) still returns `[]`.
+  If arXiv changes the rule again, the symptom is now a
+  `RuntimeError: arXiv API returned HTTP <code>` from `search_arxiv`, not silent zero
+  results.
 
 ### Known quirk (no action planned)
 - arXiv relevance search is stopword-sensitive: a question-form query like

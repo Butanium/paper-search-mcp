@@ -1,7 +1,10 @@
 # paper_search_mcp/sources/arxiv.py
 from typing import List
 from datetime import datetime
+import logging
+import ssl
 import requests
+from requests.adapters import HTTPAdapter
 import feedparser
 import time
 from ..paper import Paper
@@ -10,12 +13,35 @@ from .base import PaperSource
 from pypdf import PdfReader
 import os
 
+logger = logging.getLogger(__name__)
+
+
+class _NoALPNContext(ssl.SSLContext):
+    # urllib3 calls set_alpn_protocols(["http/1.1"]) on every context it wraps with.
+    def set_alpn_protocols(self, protocols):
+        pass
+
+
+class _NoALPNAdapter(HTTPAdapter):
+    """TLS handshake without ALPN.
+
+    arXiv's export API edge answers HTTP 406 (empty body) to the TLS ClientHello that
+    Python <= 3.13 clients send (requests/httpx/urllib all offer ALPN http/1.1); the
+    same HTTP request without ALPN gets 200. Observed 2026-09-25, see openags#121.
+    """
+
+    def init_poolmanager(self, *args, **kwargs):
+        kwargs["ssl_context"] = _NoALPNContext(ssl.PROTOCOL_TLS_CLIENT)
+        super().init_poolmanager(*args, **kwargs)
+
+
 class ArxivSearcher(PaperSource):
     """Searcher for arXiv papers"""
-    BASE_URL = "http://export.arxiv.org/api/query"
+    BASE_URL = "https://export.arxiv.org/api/query"
 
     def __init__(self):
         self.session = requests.Session()
+        self.session.mount("https://export.arxiv.org/", _NoALPNAdapter())
         self.session.headers.update({
             'User-Agent': 'paper-search-mcp/1.0 (mailto:openags@example.com)',
             'Accept': 'application/atom+xml, application/xml;q=0.9, */*;q=0.8',
@@ -29,10 +55,12 @@ class ArxivSearcher(PaperSource):
             'sortOrder': sort_order,
         }
         response = None
+        last_exc = None
         for attempt in range(3):
             try:
                 response = self.session.get(self.BASE_URL, params=params, timeout=30)
-            except requests.RequestException:
+            except requests.RequestException as exc:
+                last_exc = exc
                 time.sleep((attempt + 1) * 1.5)
                 continue
             if response.status_code == 200:
@@ -42,8 +70,17 @@ class ArxivSearcher(PaperSource):
                 continue
             break
 
-        if response is None or response.status_code != 200:
-            return []
+        # Raise rather than return []: an empty list reads as "no papers on arXiv".
+        if response is None:
+            logger.warning("arXiv API request failed after 3 attempts: %r", last_exc)
+            raise RuntimeError(f"arXiv API request failed after 3 attempts: {last_exc!r}")
+        if response.status_code != 200:
+            logger.warning(
+                "arXiv API returned HTTP %s for %s (content-type=%s, %d bytes): %r",
+                response.status_code, response.url, response.headers.get("content-type"),
+                len(response.content), response.content,
+            )
+            raise RuntimeError(f"arXiv API returned HTTP {response.status_code} for {response.url}")
 
         feed = feedparser.parse(response.content)
         papers = []
